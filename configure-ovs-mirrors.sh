@@ -65,6 +65,8 @@ load_config() {
         return 1
     fi
 
+    local -A _seen_names=()
+
     while IFS= read -r line || [[ -n "$line" ]]; do
         ((line_num++))
         # 去除註解和前後空白
@@ -140,6 +142,13 @@ load_config() {
         local src_label="${RULE_SOURCE_PORT[$idx]}"
         src_label="${src_label//\//_}"  # 清理特殊字元
         RULE_MIRROR_NAME[$idx]="mirror_${bridge}_${src_label}_to_vm${dest_vmid}i${dest_nic_index}"
+
+        # 偵測重複規則
+        if [[ -n "${_seen_names[${RULE_MIRROR_NAME[$idx]}]:-}" ]]; then
+            log_warn "Line $line_num: Duplicate rule '${RULE_MIRROR_NAME[$idx]}' (same as line ${_seen_names[${RULE_MIRROR_NAME[$idx]}]}), skipping"
+            continue
+        fi
+        _seen_names["${RULE_MIRROR_NAME[$idx]}"]="$line_num"
 
         ((idx++))
     done < "$config_file"
@@ -222,6 +231,48 @@ find_mirror_uuid() {
     ovs-vsctl --bare --columns=_uuid find Mirror name="$name" 2>/dev/null || true
 }
 
+# 檢查同名 mirror 是否已存在且配置一致（冪等性檢查）
+# 回傳 0=匹配可跳過, 1=不匹配需重建
+mirror_exists_and_matches() {
+    local name="$1"
+    local expected_src="$2"
+    local expected_dst="$3"
+    local expected_select="$4"
+
+    local uuid
+    uuid=$(find_mirror_uuid "$name")
+    [[ -z "$uuid" ]] && return 1  # mirror 不存在
+
+    # 取得預期的 port UUID
+    local expected_dst_uuid expected_src_uuid
+    expected_dst_uuid=$(ovs-vsctl --bare get Port "$expected_dst" _uuid 2>/dev/null || true)
+    expected_src_uuid=$(ovs-vsctl --bare get Port "$expected_src" _uuid 2>/dev/null || true)
+
+    # port 不存在則無法比對
+    [[ -z "$expected_dst_uuid" || -z "$expected_src_uuid" ]] && return 1
+
+    # 檢查 output-port
+    local current_output
+    current_output=$(ovs-vsctl --bare get Mirror "$uuid" output_port 2>/dev/null || true)
+    [[ "$current_output" != "$expected_dst_uuid" ]] && return 1
+
+    # 檢查 select-src-port
+    if [[ "$expected_select" == "both" || "$expected_select" == "src" ]]; then
+        local current_src
+        current_src=$(ovs-vsctl --bare get Mirror "$uuid" select_src_port 2>/dev/null || true)
+        [[ "$current_src" != *"$expected_src_uuid"* ]] && return 1
+    fi
+
+    # 檢查 select-dst-port
+    if [[ "$expected_select" == "both" || "$expected_select" == "dst" ]]; then
+        local current_dst_sel
+        current_dst_sel=$(ovs-vsctl --bare get Mirror "$uuid" select_dst_port 2>/dev/null || true)
+        [[ "$current_dst_sel" != *"$expected_src_uuid"* ]] && return 1
+    fi
+
+    return 0  # 完全匹配
+}
+
 # 查找 mirror 所屬的 bridge
 get_mirror_bridge() {
     local uuid="$1"
@@ -282,7 +333,13 @@ create_mirror_rule() {
         return 1
     fi
 
-    # 移除同名 mirror（冪等）
+    # 冪等檢查：已存在且配置一致 → 跳過
+    if mirror_exists_and_matches "$mirror_name" "$src_port" "$dest_tap" "$select"; then
+        log_info "Mirror $mirror_name already exists with correct config, skipping"
+        return 0
+    fi
+
+    # 如果存在但配置不一致，移除後重建
     remove_mirror "$mirror_name"
 
     # 等待目的 tap 介面

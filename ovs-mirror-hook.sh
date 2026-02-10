@@ -9,6 +9,7 @@ PHASE="$2"
 readonly CONFIG_DIR="/etc/ovs-mirror"
 readonly MIRRORS_CONF="$CONFIG_DIR/mirrors.conf"
 readonly CONFIGURE_SCRIPT="/usr/local/bin/configure-ovs-mirrors.sh"
+readonly LOCK_FILE="/var/run/ovs-mirror.lock"
 
 # 日誌設定
 LOG_DIR="/var/log/openvswitch"
@@ -78,21 +79,28 @@ run_configure() {
     return $rc
 }
 
+# 使用 flock 互斥鎖防止多個 hookscript 同時操作 OVS
+exec 9>"$LOCK_FILE"
+if ! flock -w 120 9; then
+    log "ERROR: Could not acquire lock $LOCK_FILE within 120s, aborting"
+    exit 1
+fi
+
 case "$PHASE" in
     post-start)
-        if $is_dest; then
-            log "VM $VMID started (destination), configuring mirrors..."
-            sleep 3  # 短暫等待 tap 介面建立，後續由 wait_for_tap() 處理
-            if ! run_configure --vm "$VMID"; then
-                log "WARNING: Mirror configuration failed for destination VM $VMID"
-            fi
-        fi
+        # 使用 if/elif 避免 source+dest 雙重角色時重複配置
+        # --all 已包含 --vm 的功能（配置所有 mirror）
         if $is_source; then
-            # Source VM 開機，重建引用其 tap 的 mirror
-            log "VM $VMID started (source), reconfiguring mirrors that use its taps..."
-            sleep 3
+            log "VM $VMID started (source), reconfiguring all mirrors..."
+            sleep 3  # 短暫等待 tap 介面建立，後續由 wait_for_tap() 處理
             if ! run_configure --all; then
                 log "WARNING: Mirror reconfiguration failed after source VM $VMID start"
+            fi
+        elif $is_dest; then
+            log "VM $VMID started (destination), configuring mirrors..."
+            sleep 3
+            if ! run_configure --vm "$VMID"; then
+                log "WARNING: Mirror configuration failed for destination VM $VMID"
             fi
         fi
         ;;
@@ -119,5 +127,9 @@ case "$PHASE" in
         log "Ignoring phase: $PHASE"
         ;;
 esac
+
+# 釋放鎖
+flock -u 9
+exec 9>&-
 
 exit 0

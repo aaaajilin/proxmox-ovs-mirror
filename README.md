@@ -11,18 +11,20 @@ Proxmox VE + Open vSwitch 流量鏡像自動配置工具。透過設定檔定義
 - **自動生命週期管理**：Hookscript 自動處理 VM 開關機時的 mirror 配置與清理
 - **VM 保護**：當作為鏡像來源或目標的 VM 關機時，自動清除引用其 tap 的 mirror，避免 OVS 錯誤
 - **失敗回滾**：部分 mirror 建立失敗時自動回滾已建立的 mirror
-- **互動式安裝**：`install.sh` 引導設定並自動安裝
+- **冪等配置**：重複執行不會重建已存在的 mirror，避免不必要的中斷
+- **並行安全**：Hookscript 使用 flock 互斥鎖，多台 VM 同時開機不會競爭
+- **互動式安裝**：`install.sh` 引導設定並自動安裝，支援既有設定檔的新增、編輯、刪除
 
 ## 架構
 
 ```mermaid
 graph LR
-    SW1[交換器 SPAN 1] --> P1[eno12419]
-    SW2[交換器 SPAN 2] --> P2[eno12429]
+    SW1[交換器 SPAN 1] --> P1[ens18]
+    SW2[交換器 SPAN 2] --> P2[ens19]
     P1 --> B1[ovs_zone1]
     P2 --> B2[ovs_zone2]
     B1 -->|Mirror| VM100[VM 100 Malcolm]
-    B1 -->|Mirror| VM101[VM 101 Claroty]
+    B1 -->|Mirror| VM101[VM 101 IDS]
     B2 -->|Mirror| VM100
     B2 -->|Mirror| VM101
     VM200[VM 200] -->|tap mirror| B1
@@ -41,7 +43,7 @@ VM 關閉 (post-stop) → Hookscript 觸發 → 驗證清理完成
 # 建立 hookscript 儲存路徑
 mkdir /var/lib/vz/snippets/
 
-git clone https://github.com/<your-repo>/proxmox-ovs-mirror.git
+git clone https://github.com/aaaajilin/proxmox-ovs-mirror.git
 cd proxmox-ovs-mirror
 sudo ./install.sh
 ```
@@ -54,6 +56,19 @@ sudo ./install.sh
 4. 安裝腳本與設定檔
 5. 綁定 hookscript 到相關 VM
 6. 選擇性立即啟用 mirror
+
+### 管理既有設定
+
+重新執行 `install.sh` 時，若已存在設定檔，會自動進入管理模式：
+
+```
+Options:
+  1) Keep existing config (skip setup)
+  2) Add new rules
+  3) Edit a rule
+  4) Delete rules
+  5) Replace all (backup & fresh setup)
+```
 
 ### 非互動式安裝
 
@@ -97,13 +112,13 @@ BRIDGE  SOURCE_PORT  DEST_VMID  DEST_NIC_INDEX  [OPTIONS...]
 | 欄位 | 說明 | 範例 |
 |------|------|------|
 | `BRIDGE` | OVS bridge 名稱 | `ovs_zone1` |
-| `SOURCE_PORT` | 來源 port（實體 port 或 VM tap） | `eno12419` 或 `vm200:0` |
+| `SOURCE_PORT` | 來源 port（實體 port 或 VM tap） | `ens18` 或 `vm200:0` |
 | `DEST_VMID` | 目的 VM ID | `100` |
 | `DEST_NIC_INDEX` | 目的 VM 的 NIC 索引（自動衍生為 `tap<VMID>i<INDEX>`） | `1` |
 
 **SOURCE_PORT 格式：**
 
-- 實體 port：直接寫名稱，如 `eno12419`
+- 實體 port：直接寫名稱，如 `ens18`
 - VM tap：使用 `vm<VMID>:<NIC_INDEX>`，如 `vm200:0` 代表 `tap200i0`
 
 **可選 OPTIONS（key=value）：**
@@ -117,18 +132,18 @@ BRIDGE  SOURCE_PORT  DEST_VMID  DEST_NIC_INDEX  [OPTIONS...]
 
 ```conf
 # 實體 SPAN port 鏡像到多台 VM
-ovs_zone1  eno12419  100  1
-ovs_zone1  eno12419  101  1
+ovs_zone1  ens18  100  1
+ovs_zone1  ens18  101  1
 
 # 另一個 Zone
-ovs_zone2  eno12429  100  2
-ovs_zone2  eno12429  101  2
+ovs_zone2  ens19  100  2
+ovs_zone2  ens19  101  2
 
 # VM-to-VM：鏡像 VM 200 的 NIC 0 到 VM 100 的 NIC 3
 ovs_zone1  vm200:0  100  3  promisc=no
 
 # 僅鏡像單方向流量
-ovs_zone1  eno12419  102  1  select=src
+ovs_zone1  ens18  102  1  select=src
 ```
 
 ### ovs-mirror.conf
@@ -173,12 +188,16 @@ configure-ovs-mirrors.sh --config /path/to/custom.conf --status
 
 Hookscript 會自動從 `/etc/ovs-mirror/mirrors.conf` 判斷每台 VM 的角色（destination、source、或兩者），並在 VM 生命週期事件中做出對應動作：
 
-| 事件 | Destination VM | Source VM |
-|------|----------------|-----------|
-| `post-start` | 建立指向此 VM 的 mirror | 執行 `--all` 重建引用其 tap 的 mirror |
-| `pre-stop` | 清除指向此 VM 的 mirror | 清除引用其 tap 的 mirror（避免 OVS 錯誤） |
-| `post-stop` | 驗證清理完成 | 驗證清理完成 |
+| 事件 | 僅 Destination VM | 僅 Source VM | Source + Destination |
+|------|-------------------|-------------|---------------------|
+| `post-start` | `--vm VMID`（建立指向此 VM 的 mirror） | `--all`（重建所有 mirror） | `--all`（已涵蓋 --vm） |
+| `pre-stop` | `--cleanup-dest VMID` | `--cleanup-source VMID` | 兩者皆執行 |
+| `post-stop` | `--cleanup VMID`（驗證） | `--cleanup VMID`（驗證） | `--cleanup VMID`（驗證） |
 
+> **並行安全機制**：所有 hookscript 執行皆透過 `flock` 互斥鎖（`/var/run/ovs-mirror.lock`）保護。當多台 VM 同時啟動時（如 Proxmox 重啟後），hookscript 會依序執行，搭配 mirror 冪等性檢查，確保不會重複建立 mirror。
+>
+> **Source + Destination 去重**：若一台 VM 同時是 mirror 的來源和目標，`post-start` 只執行 `--all`（已包含 `--vm` 的功能），避免同一 mirror 被操作兩次。
+>
 > **Destination VM 保護**：當接收鏡像流量的 VM 關機時（如 VM 100 的 `tap100i1` 作為 mirror 的 `output-port`），hookscript 會在 `pre-stop` 階段清除指向此 VM 的 mirror，避免 OVS 因 output-port 消失而產生 dangling reference 錯誤。
 >
 > **Source VM 保護**：當作為鏡像來源的 VM 關機時（如 VM 200 的 `tap200i0` 被其他 mirror 引用為 source），hookscript 同樣會在 `pre-stop` 階段先清除這些 mirror，避免 OVS 因找不到來源介面而報錯。
@@ -214,13 +233,13 @@ configure-ovs-mirrors.sh --status
 === Config File Rules ===
   #    Bridge          Source             Dest VM    Dest TAP     Mirror Name
   ---  ---------------  ------------------  ----------  ------------  ---
-  1    ovs_zone1        eno12419            VM100       tap100i1      mirror_ovs_zone1_eno12419_to_vm100i1
-  2    ovs_zone1        eno12419            VM101       tap101i1      mirror_ovs_zone1_eno12419_to_vm101i1
+  1    ovs_zone1        ens18            VM100       tap100i1      mirror_ovs_zone1_ens18_to_vm100i1
+  2    ovs_zone1        ens18            VM101       tap101i1      mirror_ovs_zone1_ens18_to_vm101i1
   Total: 2 rules
 
 === Mirror Health Check ===
-  [OK]   mirror_ovs_zone1_eno12419_to_vm100i1
-  [OK]   mirror_ovs_zone1_eno12419_to_vm101i1
+  [OK]   mirror_ovs_zone1_ens18_to_vm100i1
+  [OK]   mirror_ovs_zone1_ens18_to_vm101i1
   Result: 2 active, 0 missing
 ```
 
@@ -269,6 +288,13 @@ tail -f /var/log/openvswitch/ovs-mirror-hook.log
 - 綁定 hookscript：`qm set <vmid> --hookscript local:snippets/ovs-mirror-hook.sh`
 - 確認設定檔存在：`cat /etc/ovs-mirror/mirrors.conf`
 - 確認 VM ID 出現在設定檔中
+
+### 多台 VM 同時開機後 mirror 異常
+
+- Hookscript 使用 flock 互斥鎖防止競爭，正常情況下不會有問題
+- 確認鎖定檔案存在：`ls -la /var/run/ovs-mirror.lock`
+- 查看 hookscript 日誌確認執行順序：`tail -50 /var/log/openvswitch/ovs-mirror-hook.log`
+- 手動重建所有 mirror：`configure-ovs-mirrors.sh --all`
 
 ### 權限問題
 
