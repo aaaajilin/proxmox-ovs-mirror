@@ -1,0 +1,39 @@
+# /etc/ovs-mirror/mirrors.conf
+# OVS Mirror 規則設定檔
+#
+# 每行一條 mirror 規則，欄位以空白分隔：
+#   BRIDGE  SOURCE_PORT  DEST_VMID  DEST_NIC_INDEX  [OPTIONS...]
+#
+# BRIDGE：OVS bridge 名稱
+#
+# SOURCE_PORT 格式：
+#   - 實體 port：直接寫 port 名稱（如 eno12419）
+#   - VM 的 tap：使用 vm<VMID>:<NIC_INDEX>（如 vm200:0 表示 tap200i0）
+#
+# DEST_VMID：接收鏡像流量的目的 VM ID
+#
+# DEST_NIC_INDEX：目的 VM 的 NIC 索引，自動衍生為 tap<VMID>i<INDEX>
+#   例如：DEST_VMID=100, DEST_NIC_INDEX=1 → tap100i1
+#
+# OPTIONS（可選 key=value）：
+#   promisc=yes|no      設定來源 port 的 promiscuous mode
+#                       實體 port 預設 yes，VM tap 預設 no
+#   select=both|src|dst mirror 方向（預設 both = 雙向）
+#
+# Mirror 名稱自動產生：mirror_<bridge>_<source>_to_vm<vmid>i<nic>
+#
+# ===== 範例 =====
+
+# Zone1：實體 SPAN port 鏡像到 VM 100 和 VM 101
+ovs_zone1  eno12419  100  1
+ovs_zone1  eno12419  101  1
+
+# Zone2：另一個實體 SPAN port 鏡像到 VM 100 和 VM 101
+ovs_zone2  eno12429  100  2
+ovs_zone2  eno12429  101  2
+
+# VM-to-VM：鏡像 VM 200 的 NIC 0 (tap200i0) 到 VM 100 的 NIC 3
+# ovs_zone1  vm200:0  100  3  promisc=no
+
+# 僅鏡像單方向流量
+# ovs_zone1  eno12419  102  1  select=src

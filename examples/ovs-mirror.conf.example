@@ -1,0 +1,11 @@
+# /etc/ovs-mirror/ovs-mirror.conf
+# OVS Mirror 全域設定
+
+# 等待 tap 介面出現的最大秒數
+MAX_WAIT=120
+
+# 每次輪詢 tap 介面的間隔秒數
+WAIT_INTERVAL=5
+
+# 日誌目錄
+LOG_DIR=/var/log/openvswitch
