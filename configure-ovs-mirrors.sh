@@ -60,7 +60,8 @@ load_config() {
     local idx=0
     local line_num=0
 
-    if [[ ! -f "$config_file" ]]; then
+    # 允許 /dev/null 作為「空 config」使用情境（供 --prune 全清）
+    if [[ "$config_file" != "/dev/null" && ! -f "$config_file" ]]; then
         log_error "Config file not found: $config_file"
         return 1
     fi
@@ -366,25 +367,24 @@ create_mirror_rule() {
     # 設定 promiscuous mode
     setup_promisc_for_port "$src_port" "${RULE_PROMISC[$idx]}"
 
-    # 構建 select 參數
-    local select_args
+    # 構建 select 參數（陣列展開，避免 eval）
+    local -a select_args=()
     case "$select" in
-        both) select_args="select-src-port=@src select-dst-port=@src" ;;
-        src)  select_args="select-src-port=@src" ;;
-        dst)  select_args="select-dst-port=@src" ;;
-        *)    select_args="select-src-port=@src select-dst-port=@src" ;;
+        both) select_args=(select-src-port=@src select-dst-port=@src) ;;
+        src)  select_args=(select-src-port=@src) ;;
+        dst)  select_args=(select-dst-port=@src) ;;
+        *)    select_args=(select-src-port=@src select-dst-port=@src) ;;
     esac
 
     log_info "Creating $mirror_name on $bridge ($src_port -> $dest_tap, select=$select)"
 
-    # 使用 eval 展開 select_args（因為含有空格分隔的多個參數）
-    if ! eval ovs-vsctl \
-        -- --id=@src get Port "'$src_port'" \
-        -- --id=@dst get Port "'$dest_tap'" \
-        -- --id=@m create Mirror "'name=$mirror_name'" \
-             "$select_args" \
+    if ! ovs-vsctl \
+        -- --id=@src get Port "$src_port" \
+        -- --id=@dst get Port "$dest_tap" \
+        -- --id=@m create Mirror "name=$mirror_name" \
+             "${select_args[@]}" \
              output-port=@dst \
-        -- add Bridge "'$bridge'" mirrors @m; then
+        -- add Bridge "$bridge" mirrors @m; then
         log_error "Failed to create mirror $mirror_name"
         return 1
     fi
@@ -483,6 +483,43 @@ configure_all() {
     return 0
 }
 
+# 清除孤兒 mirror：OVS 上以 "mirror_" 前綴存在、但目前 config 不產生的 mirror
+# 命名前綴由 load_config 固定為 "mirror_"（見 RULE_MIRROR_NAME 組裝），用此前綴區隔手動建立的 mirror
+prune_orphan_mirrors() {
+    log_info "Pruning orphan mirrors (prefix='mirror_')..."
+
+    # 建立目前 config 預期存在的 mirror name 集合
+    local -A expected=()
+    for name in "${RULE_MIRROR_NAME[@]}"; do
+        expected["$name"]=1
+    done
+
+    # 列出 OVS 上所有 mirror name
+    local -a current=()
+    mapfile -t current < <(ovs-vsctl --bare --columns=name list Mirror 2>/dev/null)
+
+    local pruned=0 kept=0 skipped=0
+    for name in "${current[@]}"; do
+        [[ -z "$name" ]] && continue
+
+        # 只處理本工具命名前綴，避免誤刪手動建立的 mirror
+        if [[ "$name" != mirror_* ]]; then
+            ((skipped++))
+            continue
+        fi
+
+        if [[ -z "${expected[$name]:-}" ]]; then
+            remove_mirror "$name"
+            ((pruned++))
+        else
+            ((kept++))
+        fi
+    done
+
+    log_info "Prune complete: $pruned orphan(s) removed, $kept kept, $skipped non-managed skipped"
+    return 0
+}
+
 # ============== 狀態顯示 ==============
 
 show_status() {
@@ -548,6 +585,7 @@ Options:
   --cleanup-dest VMID    Remove mirrors where VM is a destination
   --cleanup-source VMID  Remove mirrors where VM is a source
   --all                  Configure all mirrors (default)
+  --prune                Remove orphan mirrors (prefix 'mirror_' not in current config)
   --status               Show current mirror status and health check
   --validate             Validate config file without making changes
   --config FILE          Use alternate config file
@@ -593,6 +631,10 @@ main() {
                 ;;
             --all)
                 mode="all"
+                shift
+                ;;
+            --prune)
+                mode="prune"
                 shift
                 ;;
             --status)
@@ -641,6 +683,9 @@ main() {
             ;;
         all)
             configure_all || rc=$?
+            ;;
+        prune)
+            prune_orphan_mirrors || rc=$?
             ;;
         status)
             show_status || rc=$?

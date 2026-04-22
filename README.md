@@ -90,7 +90,7 @@ sudo ./install.sh --uninstall
 | `configure-ovs-mirrors.sh` | `/usr/local/bin/` | Mirror 管理主腳本 |
 | `ovs-mirror-hook.sh` | `/var/lib/vz/snippets/` | Proxmox VM Hookscript |
 | `install.sh` | （從 repo 執行） | 互動式安裝程式 |
-| `ovs-mirror` | `/etc/logrotate.d/` | 日誌輪替設定 |
+| `ovs-mirror` | `/etc/logrotate.d/ovs-mirror` | logrotate 設定檔（輪替 `/var/log/openvswitch/*.log`） |
 
 安裝後產生的設定檔：
 
@@ -180,6 +180,12 @@ configure-ovs-mirrors.sh --cleanup-dest 100
 # 僅清除 VM 作為來源的 mirror
 configure-ovs-mirrors.sh --cleanup-source 200
 
+# 清除孤兒 mirror（OVS 上存在但目前 config 沒有的 mirror_ 前綴 mirror）
+configure-ovs-mirrors.sh --prune
+
+# 清除所有受管 mirror（搭配空 config，uninstall 用）
+configure-ovs-mirrors.sh --prune --config /dev/null
+
 # 使用替代設定檔
 configure-ovs-mirrors.sh --config /path/to/custom.conf --status
 ```
@@ -264,6 +270,9 @@ tail -f /var/log/openvswitch/ovs-mirrors.log
 
 # Hookscript 日誌
 tail -f /var/log/openvswitch/ovs-mirror-hook.log
+
+# install.sh 安裝/管理歷程
+tail -f /var/log/openvswitch/ovs-mirror-install.log
 ```
 
 ## 疑難排解
@@ -281,6 +290,12 @@ tail -f /var/log/openvswitch/ovs-mirror-hook.log
 - 通常是 source VM 關機但 mirror 未被清理
 - 確認 source VM 已綁定 hookscript：`qm config <vmid> | grep hookscript`
 - 手動清理：`configure-ovs-mirrors.sh --cleanup <vmid>`
+
+### OVS 上有孤兒 mirror（config 已無對應規則）
+
+- 發生情境：手動改 config、或早期版本的 `install.sh` 編輯/刪除規則時未同步清除 OVS
+- 清除方式：`configure-ovs-mirrors.sh --prune`（保留目前 config 內的 mirror，只刪 `mirror_` 前綴但已無規則對應者）
+- 全清：`configure-ovs-mirrors.sh --prune --config /dev/null`
 
 ### Hookscript 未觸發
 

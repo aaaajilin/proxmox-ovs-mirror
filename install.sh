@@ -11,12 +11,23 @@ readonly CONFIG_DIR="/etc/ovs-mirror"
 readonly LOGROTATE_DIR="/etc/logrotate.d"
 readonly LOG_DIR="/var/log/openvswitch"
 readonly SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+readonly INSTALL_LOG="$LOG_DIR/ovs-mirror-install.log"
 
-# ============== 顏色輸出 ==============
-info()  { echo -e "\033[1;34m[INFO]\033[0m $*"; }
-warn()  { echo -e "\033[1;33m[WARN]\033[0m $*"; }
-error() { echo -e "\033[1;31m[ERROR]\033[0m $*" >&2; }
-ok()    { echo -e "\033[1;32m[OK]\033[0m $*"; }
+# 建立 log 目錄（logrotate 的 /var/log/openvswitch/*.log 已涵蓋此檔）
+mkdir -p "$LOG_DIR" 2>/dev/null || true
+
+# ============== 日誌 ==============
+_log() {
+    local level="$1"
+    shift
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$level] $*" >> "$INSTALL_LOG" 2>/dev/null || true
+}
+
+# ============== 顏色輸出（同時寫入 log 檔）==============
+info()  { echo -e "\033[1;34m[INFO]\033[0m $*";  _log INFO  "$*"; }
+warn()  { echo -e "\033[1;33m[WARN]\033[0m $*";  _log WARN  "$*"; }
+error() { echo -e "\033[1;31m[ERROR]\033[0m $*" >&2; _log ERROR "$*"; }
+ok()    { echo -e "\033[1;32m[OK]\033[0m $*";    _log OK    "$*"; }
 
 # ============== 輔助函數 ==============
 
@@ -48,6 +59,32 @@ read_input() {
     else
         read -rp "$prompt: " answer
         echo "$answer"
+    fi
+}
+
+# 取得 configure-ovs-mirrors.sh 可執行路徑（優先已安裝版，次選 repo 版）
+_configure_script_path() {
+    if [[ -x "$INSTALL_DIR/configure-ovs-mirrors.sh" ]]; then
+        echo "$INSTALL_DIR/configure-ovs-mirrors.sh"
+    elif [[ -f "$SCRIPT_DIR/configure-ovs-mirrors.sh" ]]; then
+        echo "$SCRIPT_DIR/configure-ovs-mirrors.sh"
+    else
+        return 1
+    fi
+}
+
+# 同步 OVS 與 config：清除孤兒 mirror（config 變動後必呼叫）
+_sync_prune() {
+    local script
+    if ! script=$(_configure_script_path); then
+        warn "configure-ovs-mirrors.sh not found, skipping prune"
+        return 0
+    fi
+    info "Syncing OVS with config (prune orphan mirrors)..."
+    if bash "$script" --prune; then
+        ok "Prune completed"
+    else
+        warn "Prune reported errors (see /var/log/openvswitch/ovs-mirrors.log)"
     fi
 }
 
@@ -655,6 +692,7 @@ _config_edit_rule() {
     _RULES[$((edit_idx-1))]="$new_rule"
     _rewrite_config "$conf" _RULES
     ok "Updated rule #$edit_idx"
+    _sync_prune
     _collect_vmids_from_config "$conf"
     return 0
 }
@@ -710,6 +748,7 @@ _config_delete_rules() {
 
     _rewrite_config "$conf" remaining
     ok "Deleted ${#del_set[@]} rule(s), ${#remaining[@]} remaining"
+    _sync_prune
     _collect_vmids_from_config "$conf"
     return 0
 }
@@ -724,7 +763,11 @@ _config_replace_all() {
     echo ""
 
     interactive_setup
-    return $?
+    local rc=$?
+    if (( rc == 0 )); then
+        _sync_prune
+    fi
+    return $rc
 }
 
 # ============== 安裝檔案 ==============
@@ -796,19 +839,19 @@ do_uninstall() {
     info "=== Uninstalling OVS Mirror ==="
     echo ""
 
-    # 清除所有 mirror
-    if [[ -f "$INSTALL_DIR/configure-ovs-mirrors.sh" && -f "$CONFIG_DIR/mirrors.conf" ]]; then
-        info "Cleaning up active mirrors..."
-        "$INSTALL_DIR/configure-ovs-mirrors.sh" --status 2>/dev/null || true
-        echo ""
-        if confirm "Remove all active mirrors?"; then
-            # 取得所有 destination VM ID
-            local -a vmids=()
-            mapfile -t vmids < <(awk '!/^[[:space:]]*#/ && !/^[[:space:]]*$/ { print $3 }' "$CONFIG_DIR/mirrors.conf" 2>/dev/null | sort -u)
-            for vmid in "${vmids[@]}"; do
-                "$INSTALL_DIR/configure-ovs-mirrors.sh" --cleanup "$vmid" 2>/dev/null || true
-            done
-            ok "Active mirrors cleaned up"
+    # 清除所有 mirror：用 --prune --config /dev/null 全清 'mirror_' 前綴
+    if [[ -f "$INSTALL_DIR/configure-ovs-mirrors.sh" ]]; then
+        if [[ -f "$CONFIG_DIR/mirrors.conf" ]]; then
+            info "Current mirror status:"
+            "$INSTALL_DIR/configure-ovs-mirrors.sh" --status || true
+            echo ""
+        fi
+        if confirm "Remove all managed mirrors (prefix 'mirror_') from OVS?"; then
+            if "$INSTALL_DIR/configure-ovs-mirrors.sh" --prune --config /dev/null; then
+                ok "All managed mirrors removed"
+            else
+                warn "Prune reported errors, check /var/log/openvswitch/ovs-mirrors.log"
+            fi
         fi
     fi
 
@@ -885,6 +928,7 @@ main() {
     local mode="interactive"
     local config_file=""
     local activate=false
+    local orig_args="$*"
 
     while (( $# > 0 )); do
         case "$1" in
@@ -921,6 +965,9 @@ main() {
     echo "║   Proxmox VE + Open vSwitch             ║"
     echo "╚══════════════════════════════════════════╝"
     echo ""
+
+    _log INFO "=== install.sh start mode=$mode args=[$orig_args] ==="
+    trap '_log INFO "=== install.sh exit rc=$? ==="' EXIT
 
     HOOKSCRIPT_VMIDS=()
 
@@ -964,6 +1011,9 @@ main() {
             install_files
             attach_hookscripts
 
+            # 清除與新 config 不符的 orphan mirror
+            _sync_prune
+
             if $activate; then
                 echo ""
                 info "Activating mirrors..."
@@ -981,6 +1031,9 @@ main() {
             fi
             install_files
             attach_hookscripts
+
+            # 清除與新 config 不符的 orphan mirror（即使使用者選 Keep 也執行作為保險）
+            _sync_prune
 
             echo ""
             if confirm "Activate mirrors now?"; then
